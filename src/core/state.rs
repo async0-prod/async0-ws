@@ -1,3 +1,6 @@
+use axum::extract::ws::Message;
+use futures_util::StreamExt;
+use redis::AsyncTypedCommands;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -5,7 +8,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
@@ -49,372 +52,239 @@ pub struct SubscriberInfo {
 #[derive(Debug, Clone)]
 pub struct PublisherInfo {
     pub id: Uuid,
-    pub addr: SocketAddr,
+    // pub addr: SocketAddr
     pub created_at: std::time::SystemTime,
     pub subscriber_count: usize,
 }
 
 #[derive(Debug)]
-struct PublisherData {
+struct _PublisherData {
     pub info: PublisherInfo,
     pub sender: broadcast::Sender<Value>,
     pub subscriber_ids: Vec<Uuid>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AppStateInner {
-    publishers: HashMap<Uuid, PublisherData>,
-    subscribers: HashMap<Uuid, SubscriberInfo>,
+    redis: redis::Client,
+    // publishers: HashMap<Uuid, PublisherData>,
+    // subscribers: HashMap<Uuid, SubscriberInfo>,
 }
 
-#[derive(Debug, Default)]
+impl AppStateInner {
+    fn new(redis: redis::Client) -> Self {
+        Self {
+            redis,
+            // publishers: HashMap::new(),
+            // subscribers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AppState {
     inner: Mutex<AppStateInner>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        return Self::default();
+    pub fn new(redis: redis::Client) -> Self {
+        let inner = AppStateInner::new(redis);
+
+        Self {
+            inner: Mutex::new(inner),
+        }
     }
 
     fn _lock_inner(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
         self.inner.lock().map_err(|_| AppStateError::LockError)
     }
 
-    pub fn add_publisher(&self, id: Uuid, addr: SocketAddr) -> Result<(), AppStateError> {
-        let mut inner = self._lock_inner()?;
-
-        // check if the publisher already exists in the hashmap
-        if inner.publishers.contains_key(&id) {
-            return Err(AppStateError::PublisherAlreadyExists { id });
-        }
-
-        let (sender, _receiver) = broadcast::channel(100);
-
-        let info = PublisherInfo {
-            id,
-            addr,
-            created_at: std::time::SystemTime::now(),
-            subscriber_count: 0,
+    pub async fn add_publisher(&self, id: Uuid) -> Result<(), AppStateError> {
+        let redis = {
+            let inner = self._lock_inner()?;
+            inner.redis.clone()
         };
+        let mut conn = redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|_| AppStateError::GenericError)?;
 
-        let data = PublisherData {
-            info,
-            sender,
-            subscriber_ids: Vec::new(),
-        };
+        let key = format!("publisher:{}", id);
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("online")
+            .arg("EX")
+            .arg(20) // expires after 20s unless refreshed by publisher
+            .query_async(&mut conn)
+            .await
+            .map_err(|_| AppStateError::GenericError)?;
 
-        inner.publishers.insert(id, data);
+        // let result = conn
+        //     .publish(id.to_string(), "Hello")
+        //     .await
+        //     .map_err(|_| AppStateError::GenericError)?;
 
-        return Ok(());
+        Ok(())
     }
 
-    pub fn remove_publisher(&self, id: Uuid) -> Result<(), AppStateError> {
-        let mut inner = self._lock_inner()?;
+    pub async fn add_subscriber(
+        &self,
+        id: Uuid,
+        publisher_id: Uuid,
+        tx: mpsc::Sender<Message>,
+    ) -> Result<(), AppStateError> {
+        let redis = {
+            let inner = self._lock_inner()?;
+            inner.redis.clone()
+        };
 
-        let publisher = inner
-            .publishers
-            .remove(&id)
-            .ok_or(AppStateError::PublisherNotFound { id })?;
+        {
+            let mut conn = redis
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|_| AppStateError::GenericError)?;
+            let key = format!("publisher:{}", publisher_id);
+            let exists: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|_| AppStateError::GenericError)?;
 
-        // send a notif that im closing
-        let notification = serde_json::json!({
-            "kind": "response",
-            "success": false,
-            "message": format!("Publisher {} has been deregistered", id),
-            "data": null
+            if exists.is_none() {
+                return Err(AppStateError::GenericError);
+            }
+        }
+
+        println!("Subscriber {} listening to publisher {}", id, publisher_id);
+
+        tokio::spawn(async move {
+            let mut pubsub = match redis.get_async_pubsub().await {
+                Ok(ps) => ps,
+                Err(e) => {
+                    eprintln!("Failed to create async pubsub for {}: {}", id, e);
+                    return;
+                }
+            };
+
+            if let Err(e) = pubsub.subscribe(publisher_id.to_string()).await {
+                eprintln!(
+                    "Failed to subscribe subscriber {} to publisher {}: {}",
+                    id, publisher_id, e
+                );
+                return;
+            }
+
+            loop {
+                let mut stream = pubsub.on_message();
+
+                let msg = match stream.next().await {
+                    Some(m) => m,
+                    None => {
+                        eprintln!("Pubsub ended for subscriber {}", id);
+                        break;
+                    }
+                };
+
+                let payload: String = match msg.get_payload() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Payload parse error: {}", e);
+                        continue;
+                    }
+                };
+
+                println!("Message payload received: {}", payload);
+
+                if payload == "__END__" {
+                    println!("Publisher {} ended stream.", publisher_id);
+                    break;
+                }
+
+                if tx.send(Message::Text(payload.into())).await.is_err() {
+                    println!("WebSocket closed for subscriber {}", id);
+                    break;
+                }
+            }
+
+            let _ = pubsub.unsubscribe(publisher_id.to_string());
+            println!("Subscriber {} unsubscribed from {}", id, publisher_id);
         });
-        let _ = publisher.sender.send(notification);
 
-        // remove all subscribers of this publisher
-        for subscriber_id in publisher.subscriber_ids {
-            inner.subscribers.remove(&subscriber_id);
-        }
-
-        return Ok(());
+        Ok(())
     }
 
-    pub fn get_publisher_sender(
-        &self,
-        id: Uuid,
-    ) -> Result<broadcast::Sender<Value>, AppStateError> {
-        let inner = self._lock_inner()?;
-
-        inner
-            .publishers
-            .get(&id)
-            .map(|p| p.sender.clone())
-            .ok_or(AppStateError::PublisherNotFound { id })
-    }
-
-    pub fn publisher_exists(&self, id: Uuid) -> Result<bool, AppStateError> {
-        let inner = self._lock_inner()?;
-        return Ok(inner.publishers.contains_key(&id));
-    }
-
-    pub fn get_publisher_info(&self, id: Uuid) -> Result<PublisherInfo, AppStateError> {
-        let inner = self._lock_inner()?;
-        inner
-            .publishers
-            .get(&id)
-            .map(|p| {
-                let mut info = p.info.clone();
-                info.subscriber_count = p.subscriber_ids.len();
-                info
-            })
-            .ok_or(AppStateError::PublisherNotFound { id })
-    }
-
-    pub fn list_publishers(&self) -> Result<Vec<PublisherInfo>, AppStateError> {
-        let inner = self._lock_inner()?;
-
-        let mut publishers_arr = Vec::new();
-        for data in inner.publishers.values() {
-            let mut info = data.info.clone();
-            info.subscriber_count = data.subscriber_ids.len();
-            publishers_arr.push(info);
-        }
-
-        return Ok(publishers_arr);
-    }
-
-    pub fn subscriber_exists(&self, id: Uuid) -> Result<bool, AppStateError> {
-        let inner = self._lock_inner()?;
-        return Ok(inner.subscribers.contains_key(&id));
-    }
-
-    pub fn add_subscriber(
-        &self,
-        id: Uuid,
-        publisher_id: Uuid,
-        addr: SocketAddr,
-        max_subscribers_per_publisher: Option<usize>,
-    ) -> Result<(), AppStateError> {
-        let mut inner = self._lock_inner()?;
-
-        if inner.subscribers.contains_key(&id) {
-            return Err(AppStateError::SubscriberAlreadyExists { id });
-        }
-
-        if !inner.publishers.contains_key(&publisher_id) {
-            return Err(AppStateError::PublisherNotFound { id: publisher_id });
-        }
-
-        if let Some(max) = max_subscribers_per_publisher {
-            let current_count = inner
-                .publishers
-                .get(&publisher_id)
-                .map(|p| p.subscriber_ids.len())
-                .unwrap_or(0);
-
-            if current_count >= max {
-                return Err(AppStateError::MaxSubscribersReached { publisher_id, max });
-            }
-        }
-
-        let info = SubscriberInfo {
-            id,
-            publisher_id,
-            addr,
-            connected_at: std::time::SystemTime::now(),
+    pub async fn publish_message(&self, id: Uuid, data: Value) -> Result<(), AppStateError> {
+        let redis = {
+            let inner = self._lock_inner()?;
+            inner.redis.clone()
         };
+        let mut conn = redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|_| AppStateError::GenericError)?;
 
-        inner.subscribers.insert(id, info);
-        let publisher = inner
-            .publishers
-            .get_mut(&publisher_id)
-            .ok_or(AppStateError::PublisherNotFound { id: publisher_id })?;
-        publisher.subscriber_ids.push(id);
+        {
+            let mut conn = redis
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|_| AppStateError::GenericError)?;
+            let key = format!("publisher:{}", id);
+            let exists: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|_| AppStateError::GenericError)?;
 
-        return Ok(());
-    }
-
-    pub fn remove_subscriber(&self, id: Uuid) -> Result<SubscriberInfo, AppStateError> {
-        let mut inner = self._lock_inner()?;
-
-        let subscriber = inner
-            .subscribers
-            .remove(&id)
-            .ok_or(AppStateError::SubscriberNotFound { id })?;
-
-        if let Some(publisher) = inner.publishers.get_mut(&subscriber.publisher_id) {
-            publisher.subscriber_ids.retain(|sub_id| *sub_id != id);
-        }
-
-        return Ok(subscriber);
-    }
-
-    pub fn get_subscriber(&self, id: Uuid) -> Result<SubscriberInfo, AppStateError> {
-        let inner = self._lock_inner()?;
-
-        inner
-            .subscribers
-            .get(&id)
-            .cloned()
-            .ok_or(AppStateError::SubscriberNotFound { id })
-    }
-
-    pub fn list_subscribers_by_publisher_id(
-        &self,
-        publisher_id: Uuid,
-    ) -> Result<Vec<SubscriberInfo>, AppStateError> {
-        let inner = self._lock_inner()?;
-
-        let publisher = inner
-            .publishers
-            .get(&publisher_id)
-            .ok_or(AppStateError::PublisherNotFound { id: publisher_id })?;
-
-        let mut result = Vec::new();
-        for subscriber_id in &publisher.subscriber_ids {
-            if let Some(sub_info) = inner.subscribers.get(subscriber_id) {
-                result.push(sub_info.clone());
+            if exists.is_none() {
+                return Err(AppStateError::GenericError);
             }
         }
 
-        return Ok(result);
+        let _result = conn
+            .publish(id.to_string(), data.to_string())
+            .await
+            .map_err(|_| AppStateError::GenericError)?;
+
+        Ok(())
     }
 
-    pub fn list_subscribers(&self) -> Result<Vec<SubscriberInfo>, AppStateError> {
-        let inner = self._lock_inner()?;
-        return Ok(inner.subscribers.values().cloned().collect());
-    }
+    // pub fn remove_subscriber(&self, id: Uuid) -> Result<SubscriberInfo, AppStateError> {
+    //     let mut inner = self._lock_inner()?;
 
-    pub fn get_subscriber_count_by_publisher_id(
-        &self,
-        publisher_id: Uuid,
-    ) -> Result<usize, AppStateError> {
-        let inner = self._lock_inner()?;
+    //     let subscriber = inner
+    //         .subscribers
+    //         .remove(&id)
+    //         .ok_or(AppStateError::SubscriberNotFound { id })?;
 
-        let publisher = inner
-            .publishers
-            .get(&publisher_id)
-            .ok_or(AppStateError::PublisherNotFound { id: publisher_id })?;
+    //     if let Some(publisher) = inner.publishers.get_mut(&subscriber.publisher_id) {
+    //         publisher.subscriber_ids.retain(|sub_id| *sub_id != id);
+    //     }
 
-        return Ok(publisher.subscriber_ids.len());
-    }
+    //     return Ok(subscriber);
+    // }
 
-    pub fn is_subscribed(
-        &self,
-        subscriber_id: Uuid,
-        publisher_id: Uuid,
-    ) -> Result<bool, AppStateError> {
-        let inner = self._lock_inner()?;
+    // pub fn remove_publisher(&self, id: Uuid) -> Result<(), AppStateError> {
+    //     let mut inner = self._lock_inner()?;
 
-        let publisher = inner
-            .publishers
-            .get(&publisher_id)
-            .ok_or(AppStateError::PublisherNotFound { id: publisher_id })?;
+    //     let publisher = inner
+    //         .publishers
+    //         .remove(&id)
+    //         .ok_or(AppStateError::PublisherNotFound { id })?;
 
-        return Ok(publisher.subscriber_ids.contains(&subscriber_id));
-    }
+    //     // send a notif that im closing
+    //     let notification = serde_json::json!({
+    //         "kind": "response",
+    //         "success": false,
+    //         "message": format!("Publisher {} has been deregistered", id),
+    //         "data": null
+    //     });
+    //     let _ = publisher.sender.send(notification);
 
-    pub fn unsubscribe(
-        &self,
-        subscriber_id: Uuid,
-        publisher_id: Uuid,
-    ) -> Result<(), AppStateError> {
-        let mut inner = self._lock_inner()?;
+    //     // remove all subscribers of this publisher
+    //     for subscriber_id in publisher.subscriber_ids {
+    //         inner.subscribers.remove(&subscriber_id);
+    //     }
 
-        // ensure subscriber exists
-        let subscriber = inner
-            .subscribers
-            .get(&subscriber_id)
-            .cloned()
-            .ok_or(AppStateError::SubscriberNotFound { id: subscriber_id })?;
-
-        if subscriber.publisher_id != publisher_id {
-            return Err(AppStateError::NotSubscribed {
-                id: subscriber_id,
-                publisher_id,
-            });
-        }
-
-        inner.subscribers.remove(&subscriber_id);
-        if let Some(publisher) = inner.publishers.get_mut(&publisher_id) {
-            publisher.subscriber_ids.retain(|id| *id != subscriber_id);
-        }
-
-        return Ok(());
-    }
-
-    pub fn publish_message(&self, publisher_id: Uuid, data: Value) -> Result<usize, AppStateError> {
-        let inner = self._lock_inner()?;
-
-        let publisher = inner
-            .publishers
-            .get(&publisher_id)
-            .ok_or(AppStateError::PublisherNotFound { id: publisher_id })?;
-
-        publisher
-            .sender
-            .send(data)
-            .map_err(|e| AppStateError::MessageSendFailed {
-                id: publisher_id,
-                reason: e.to_string(),
-            })
-    }
-
-    pub fn cleanup_subscriber_by_addr(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<Option<SubscriberInfo>, AppStateError> {
-        let mut inner = self._lock_inner()?;
-
-        let subscriber_id = inner
-            .subscribers
-            .iter()
-            .find(|(_, info)| info.addr == addr)
-            .map(|(id, _)| *id);
-
-        if let Some(id) = subscriber_id {
-            let sub = inner.subscribers.remove(&id).unwrap();
-
-            if let Some(pub_data) = inner.publishers.get_mut(&sub.publisher_id) {
-                pub_data.subscriber_ids.retain(|sid| *sid != id);
-            }
-
-            return Ok(Some(sub));
-        } else {
-            return Ok(None);
-        }
-    }
-
-    pub fn cleanup_publisher_by_addr(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<Option<PublisherInfo>, AppStateError> {
-        let mut inner = self._lock_inner()?;
-
-        let publisher_id = inner
-            .publishers
-            .iter()
-            .find(|(_, data)| data.info.addr == addr)
-            .map(|(id, _)| *id);
-
-        if let Some(id) = publisher_id {
-            let publisher = inner.publishers.remove(&id).unwrap();
-
-            // notify subscribers
-            let notification = serde_json::json!({
-                "kind": "response",
-                "success": false,
-                "message": format!("Publisher {} has been deregistered", id),
-                "data": null
-            });
-            let _ = publisher.sender.send(notification);
-
-            // remove all subscribers
-            for sub_id in &publisher.subscriber_ids {
-                inner.subscribers.remove(sub_id);
-            }
-
-            let mut info = publisher.info.clone();
-            info.subscriber_count = publisher.subscriber_ids.len();
-
-            return Ok(Some(info));
-        } else {
-            return Ok(None);
-        }
-    }
+    //     return Ok(());
+    // }
 }
