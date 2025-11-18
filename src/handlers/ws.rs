@@ -1,6 +1,13 @@
-use anyhow::{self, Context, Result};
+use crate::{
+    UserMessage,
+    core::state::AppState,
+    store::ws::{
+        handle_user_deregister, handle_user_message, handle_user_register, handle_user_subscribe,
+        handle_user_unsubscribe,
+    },
+};
+use anyhow::{self, Context};
 use axum::{
-    body::Bytes,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -8,23 +15,18 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::{TypedHeader, headers};
-use std::{net::SocketAddr, sync::Arc};
-
-use crate::{
-    ClientStore, UserMessage,
-    core::state::AppState,
-    store::ws::{
-        handle_get_stats, handle_user_deregister, handle_user_message, handle_user_register,
-        handle_user_subscribe, handle_user_unsubscribe,
-    },
-    utils::utils::send_error_response,
+use futures_util::{
+    sink::SinkExt,
+    stream::{SplitSink, SplitStream, StreamExt},
 };
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::mpsc;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State((state, client_store)): State<(Arc<AppState>, ClientStore)>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let user_agent = user_agent
         .map(|TypedHeader(agent)| agent.to_string())
@@ -32,128 +34,100 @@ pub async fn ws_handler(
 
     println!("`{user_agent}` at {addr} connected.");
 
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, state, client_store))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
 }
 
 // every request/user gets their own handle_socket function
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     addr: SocketAddr,
     state: Arc<AppState>,
-    client_store: ClientStore,
+    // _client_store: ClientStore,
 ) {
-    // Send initial ping
-    if let Err(e) = socket
-        .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
-        .await
-        .with_context(|| format!("Failed to send ping to {addr}"))
-    {
-        eprintln!("Failed to send ping to {addr}: {e}");
-        return;
-    }
+    let (ws_sender, ws_receiver) = socket.split();
 
-    while let Some(msg_result) = socket.recv().await {
-        let ws_message = match msg_result {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("Error receiving message from {addr}: {e}");
-                break;
+    let (tx, rx) = mpsc::channel::<Message>(1000);
+    tokio::spawn(write(ws_sender, rx));
+    tokio::spawn(read(state, ws_receiver, tx));
+
+    // TODO
+    // cleanup when client disconnects
+    // cleanup_client_from_store(addr, &state).await;
+    println!("Client {addr} disconnected");
+}
+
+async fn read(
+    state: Arc<AppState>,
+    mut receiver: SplitStream<WebSocket>,
+    tx: mpsc::Sender<Message>,
+) {
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Binary(data) => {
+                println!("Received {} bytes of binary data from ", data.len());
             }
-        };
-
-        match ws_message {
+            Message::Close(_) => {
+                println!("Client  closed connection");
+            }
+            Message::Pong(_) => {
+                println!("Received pong from ");
+            }
+            Message::Ping(_) => {
+                println!("Received ping from ");
+            }
             Message::Text(text) => {
-                let parsed: Result<UserMessage> =
-                    serde_json::from_str(&text).context("Invalid message");
+                let parsed =
+                    serde_json::from_str::<UserMessage>(&text).context("Error parsing message");
 
                 let user_message = match parsed {
                     Ok(msg) => msg,
                     Err(e) => {
-                        eprintln!("Failed to parse user message from {addr}: {e}");
-                        send_error_response(&mut socket).await;
+                        eprintln!("Failed to parse user message: {e}");
+                        // let _ = send_response(&mut socket, ServerResponse::error()).await;
                         break;
                     }
                 };
 
+                println!("{:?}", user_message);
+
                 let result = match user_message {
                     UserMessage::Register { user_id } => {
-                        handle_user_register(&mut socket, addr, user_id, &state, &client_store)
-                            .await
+                        handle_user_register(user_id, &state).await
                     }
-
                     UserMessage::Deregister { user_id } => {
-                        handle_user_deregister(&mut socket, addr, user_id, &state, &client_store)
-                            .await
+                        handle_user_deregister(user_id, &&state, tx.clone()).await
                     }
-
-                    UserMessage::Message { publisher_id, data } => {
-                        handle_user_message(
-                            &mut socket,
-                            addr,
-                            publisher_id,
-                            data,
-                            &state,
-                            &client_store,
-                        )
-                        .await
-                    }
-
                     UserMessage::Subscribe {
                         publisher_id,
                         subscriber_id,
                     } => {
-                        handle_user_subscribe(
-                            &mut socket,
-                            addr,
-                            subscriber_id,
-                            publisher_id,
-                            &state,
-                            &client_store,
-                        )
-                        .await
+                        handle_user_subscribe(subscriber_id, publisher_id, &state, tx.clone()).await
                     }
-
-                    UserMessage::Unsubscribe {
-                        publisher_id,
-                        subscriber_id,
-                    } => {
-                        handle_user_unsubscribe(
-                            &mut socket,
-                            addr,
-                            subscriber_id,
-                            publisher_id,
-                            &state,
-                            &client_store,
-                        )
-                        .await
+                    UserMessage::Unsubscribe { subscriber_id } => {
+                        handle_user_unsubscribe(subscriber_id, &state, tx.clone()).await
                     }
-
-                    UserMessage::GetStats => handle_get_stats(&mut socket, &state).await,
+                    UserMessage::Message { publisher_id, data } => {
+                        handle_user_message(publisher_id, data, &state).await
+                    }
+                    UserMessage::GetStats => todo!(),
                 };
 
                 if let Err(e) = result {
-                    eprintln!("Error handling message from {addr}: {e}");
-                    send_error_response(&mut socket).await;
+                    eprintln!("Error handling message: {e}");
+                    // let _ = send_response(&mut socket, ServerResponse::error()).await;
                     break;
                 }
             }
-            Message::Binary(data) => {
-                println!("Received {} bytes of binary data from {addr}", data.len());
-            }
-            Message::Close(_) => {
-                println!("Client {addr} closed connection");
-            }
-            Message::Pong(_) => {
-                println!("Received pong from {addr}");
-            }
-            Message::Ping(_) => {
-                println!("Received ping from {addr}");
-            }
         }
-    }
 
-    // TODO
-    // cleanup when client disconnects
-    // cleanup_client_from_store(addr, &state, &client_store).await;
-    println!("Client {addr} disconnected");
+        // Send success response back through channel
+        let response = Message::Text("Success".into());
+        let _ = tx.send(response).await;
+    }
+}
+
+async fn write(mut sender: SplitSink<WebSocket, Message>, mut rx: mpsc::Receiver<Message>) {
+    while let Some(msg) = rx.recv().await {
+        sender.send(msg).await.ok();
+    }
 }
